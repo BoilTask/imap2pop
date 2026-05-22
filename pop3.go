@@ -201,7 +201,6 @@ func (s *pop3Session) cmdPass(arg string) {
 		s.username = ""
 		return
 	}
-	ic.prefetchHeaders()
 
 	s.imap = ic
 	s.state = "TRANSACTION"

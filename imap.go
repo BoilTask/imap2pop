@@ -210,32 +210,72 @@ func (ic *ImapConnection) fetchSizes() error {
 	return nil
 }
 
-func (ic *ImapConnection) prefetchHeaders() error {
-	if ic.messageCount == 0 {
-		return nil
-	}
-	result, err := ic.sendCommand("FETCH 1:* (BODY[HEADER])")
-	if err != nil {
-		log.Printf("[%s] prefetch headers failed: %v", ic.sessionID, err)
-		return nil // non-fatal: TOP will still work via individual fetches
-	}
-	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
-		log.Printf("[%s] prefetch headers failed: %s", ic.sessionID, result.tagged)
-		return nil
+const headerBatchSize = 50
+
+// fetchHeadersWithCache: return cached header if available,
+// otherwise batch-fetch headers for a range and cache them.
+func (ic *ImapConnection) fetchHeadersWithCache(seqNum int) (string, error) {
+	if h, ok := ic.messageHdrs[seqNum]; ok {
+		log.Printf("[%s] headers #%d cached, %d bytes", ic.sessionID, seqNum, len(h))
+		return h, nil
 	}
 
-	ic.messageHdrs = make(map[int]string)
+	// Determine batch range around seqNum
+	start := seqNum
+	end := seqNum + headerBatchSize - 1
+	if end > ic.messageCount {
+		end = ic.messageCount
+	}
+	// Shift start down if seqNum is near the end so we still fetch a full batch
+	if end - start + 1 < headerBatchSize {
+		start = end - headerBatchSize + 1
+		if start < 1 {
+			start = 1
+		}
+	}
+
+	result, err := ic.sendCommand(fmt.Sprintf("FETCH %d:%d (BODY[HEADER])", start, end))
+	if err != nil {
+		// Fallback: single fetch
+		return ic.fetchHeadersSingle(seqNum)
+	}
+	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
+		return ic.fetchHeadersSingle(seqNum)
+	}
+
+	reFetch := regexp.MustCompile(`\* (\d+) FETCH`)
+	cached := 0
 	for i, line := range result.lines {
-		m := regexp.MustCompile(`\* (\d+) FETCH`).FindStringSubmatch(line)
+		m := reFetch.FindStringSubmatch(line)
 		if m != nil {
 			seq, _ := strconv.Atoi(m[1])
 			if lit, ok := result.literals[i]; ok {
 				ic.messageHdrs[seq] = lit
+				cached++
 			}
 		}
 	}
-	log.Printf("[%s] prefetch headers OK, %d cached", ic.sessionID, len(ic.messageHdrs))
-	return nil
+	log.Printf("[%s] batch FETCH headers %d:%d, cached %d", ic.sessionID, start, end, cached)
+
+	h, ok := ic.messageHdrs[seqNum]
+	if !ok {
+		return ic.fetchHeadersSingle(seqNum)
+	}
+	return h, nil
+}
+
+func (ic *ImapConnection) fetchHeadersSingle(seqNum int) (string, error) {
+	result, err := ic.sendCommand(fmt.Sprintf("FETCH %d (BODY[HEADER])", seqNum))
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
+		return "", fmt.Errorf("FETCH headers failed: %s", result.tagged)
+	}
+	h := ic.getLiteralForSeq(result, seqNum)
+	ic.messageHdrs[seqNum] = h
+	log.Printf("[%s] FETCH headers #%d, %d bytes", ic.sessionID, seqNum, len(h))
+	return h, nil
 }
 
 func (ic *ImapConnection) fetchUids() error {
@@ -271,25 +311,8 @@ func (ic *ImapConnection) fetchMessage(seqNum int) (string, error) {
 	return msg, nil
 }
 
-func (ic *ImapConnection) fetchHeaders(seqNum int) (string, error) {
-	if h, ok := ic.messageHdrs[seqNum]; ok {
-		log.Printf("[%s] headers #%d from cache, %d bytes", ic.sessionID, seqNum, len(h))
-		return h, nil
-	}
-	result, err := ic.sendCommand(fmt.Sprintf("FETCH %d (BODY[HEADER])", seqNum))
-	if err != nil {
-		return "", err
-	}
-	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
-		return "", fmt.Errorf("FETCH headers failed: %s", result.tagged)
-	}
-	h := ic.getLiteralForSeq(result, seqNum)
-	log.Printf("[%s] FETCH headers #%d, %d bytes", ic.sessionID, seqNum, len(h))
-	return h, nil
-}
-
 func (ic *ImapConnection) fetchTop(seqNum int, lineCount int) (string, error) {
-	headers, err := ic.fetchHeaders(seqNum)
+	headers, err := ic.fetchHeadersWithCache(seqNum)
 	if err != nil {
 		return "", err
 	}

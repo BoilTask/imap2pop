@@ -36,6 +36,7 @@ type ImapConnection struct {
 
 	messageSizes map[int]int
 	messageUids  map[int]string
+	messageHdrs  map[int]string // pre-cached headers
 	deleted      map[int]bool
 	messageCount int
 }
@@ -45,6 +46,7 @@ func newImapConnection(sessionID string) *ImapConnection {
 		sessionID:    sessionID,
 		messageSizes: make(map[int]int),
 		messageUids:  make(map[int]string),
+		messageHdrs:  make(map[int]string),
 		deleted:      make(map[int]bool),
 	}
 }
@@ -208,6 +210,34 @@ func (ic *ImapConnection) fetchSizes() error {
 	return nil
 }
 
+func (ic *ImapConnection) prefetchHeaders() error {
+	if ic.messageCount == 0 {
+		return nil
+	}
+	result, err := ic.sendCommand("FETCH 1:* (BODY[HEADER])")
+	if err != nil {
+		log.Printf("[%s] prefetch headers failed: %v", ic.sessionID, err)
+		return nil // non-fatal: TOP will still work via individual fetches
+	}
+	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
+		log.Printf("[%s] prefetch headers failed: %s", ic.sessionID, result.tagged)
+		return nil
+	}
+
+	ic.messageHdrs = make(map[int]string)
+	for i, line := range result.lines {
+		m := regexp.MustCompile(`\* (\d+) FETCH`).FindStringSubmatch(line)
+		if m != nil {
+			seq, _ := strconv.Atoi(m[1])
+			if lit, ok := result.literals[i]; ok {
+				ic.messageHdrs[seq] = lit
+			}
+		}
+	}
+	log.Printf("[%s] prefetch headers OK, %d cached", ic.sessionID, len(ic.messageHdrs))
+	return nil
+}
+
 func (ic *ImapConnection) fetchUids() error {
 	result, err := ic.sendCommand("FETCH 1:* (UID)")
 	if err != nil {
@@ -242,6 +272,10 @@ func (ic *ImapConnection) fetchMessage(seqNum int) (string, error) {
 }
 
 func (ic *ImapConnection) fetchHeaders(seqNum int) (string, error) {
+	if h, ok := ic.messageHdrs[seqNum]; ok {
+		log.Printf("[%s] headers #%d from cache, %d bytes", ic.sessionID, seqNum, len(h))
+		return h, nil
+	}
 	result, err := ic.sendCommand(fmt.Sprintf("FETCH %d (BODY[HEADER])", seqNum))
 	if err != nil {
 		return "", err

@@ -18,8 +18,9 @@ const imapPort = 993
 var (
 	reLiteral    = regexp.MustCompile(`\{(\d+)\}$`)
 	reExists     = regexp.MustCompile(`\* (\d+) EXISTS`)
-	reSize       = regexp.MustCompile(`\* (\d+) FETCH \(RFC822\.SIZE (\d+)\)`)
-	reUid        = regexp.MustCompile(`\* (\d+) FETCH \(UID (\d+)\)`)
+	reFetchSeq   = regexp.MustCompile(`\* (\d+) FETCH`)
+	reSizeField  = regexp.MustCompile(`RFC822\.SIZE (\d+)`)
+	reUidField   = regexp.MustCompile(`UID (\d+)`)
 )
 
 type imapResult struct {
@@ -36,7 +37,8 @@ type ImapConnection struct {
 
 	messageSizes map[int]int
 	messageUids  map[int]string
-	messageHdrs  map[int]string // pre-cached headers
+	messageHdrs  map[int]string // cached headers
+	messageCache map[int]string // cached full messages (RETR)
 	deleted      map[int]bool
 	messageCount int
 }
@@ -47,6 +49,7 @@ func newImapConnection(sessionID string) *ImapConnection {
 		messageSizes: make(map[int]int),
 		messageUids:  make(map[int]string),
 		messageHdrs:  make(map[int]string),
+		messageCache: make(map[int]string),
 		deleted:      make(map[int]bool),
 	}
 }
@@ -60,6 +63,11 @@ func (ic *ImapConnection) connect() error {
 	}
 	ic.conn = conn
 	ic.reader = bufio.NewReader(conn)
+
+	// Set TCP_NODELAY on IMAP connection for lower latency
+	if nc, ok := conn.NetConn().(*net.TCPConn); ok {
+		nc.SetNoDelay(true)
+	}
 
 	greeting, err := ic.reader.ReadString('\n')
 	if err != nil {
@@ -189,44 +197,50 @@ func (ic *ImapConnection) selectInbox() error {
 	return nil
 }
 
-func (ic *ImapConnection) fetchSizes() error {
-	result, err := ic.sendCommand("FETCH 1:* (RFC822.SIZE)")
+// Combined: fetch sizes and UIDs in one IMAP command
+func (ic *ImapConnection) fetchSizesAndUids() error {
+	result, err := ic.sendCommand("FETCH 1:* (RFC822.SIZE UID)")
 	if err != nil {
 		return err
 	}
 	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
-		return fmt.Errorf("FETCH sizes failed: %s", result.tagged)
+		return fmt.Errorf("FETCH sizes+UIDs failed: %s", result.tagged)
 	}
 
 	for _, line := range result.lines {
-		m := reSize.FindStringSubmatch(line)
-		if m != nil {
-			seq, _ := strconv.Atoi(m[1])
-			size, _ := strconv.Atoi(m[2])
-			ic.messageSizes[seq] = size
+		seqM := reFetchSeq.FindStringSubmatch(line)
+		if seqM == nil {
+			continue
+		}
+		seq, _ := strconv.Atoi(seqM[1])
+
+		sm := reSizeField.FindStringSubmatch(line)
+		if sm != nil {
+			ic.messageSizes[seq], _ = strconv.Atoi(sm[1])
+		}
+
+		um := reUidField.FindStringSubmatch(line)
+		if um != nil {
+			ic.messageUids[seq] = um[1]
 		}
 	}
-	log.Printf("[%s] FETCH sizes OK, %d entries", ic.sessionID, len(ic.messageSizes))
+	log.Printf("[%s] FETCH sizes+UIDs OK, %d sizes, %d UIDs", ic.sessionID, len(ic.messageSizes), len(ic.messageUids))
 	return nil
 }
 
 const headerBatchSize = 50
 
-// fetchHeadersWithCache: return cached header if available,
-// otherwise batch-fetch headers for a range and cache them.
 func (ic *ImapConnection) fetchHeadersWithCache(seqNum int) (string, error) {
 	if h, ok := ic.messageHdrs[seqNum]; ok {
 		log.Printf("[%s] headers #%d cached, %d bytes", ic.sessionID, seqNum, len(h))
 		return h, nil
 	}
 
-	// Determine batch range around seqNum
 	start := seqNum
 	end := seqNum + headerBatchSize - 1
 	if end > ic.messageCount {
 		end = ic.messageCount
 	}
-	// Shift start down if seqNum is near the end so we still fetch a full batch
 	if end - start + 1 < headerBatchSize {
 		start = end - headerBatchSize + 1
 		if start < 1 {
@@ -236,17 +250,15 @@ func (ic *ImapConnection) fetchHeadersWithCache(seqNum int) (string, error) {
 
 	result, err := ic.sendCommand(fmt.Sprintf("FETCH %d:%d (BODY[HEADER])", start, end))
 	if err != nil {
-		// Fallback: single fetch
 		return ic.fetchHeadersSingle(seqNum)
 	}
 	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
 		return ic.fetchHeadersSingle(seqNum)
 	}
 
-	reFetch := regexp.MustCompile(`\* (\d+) FETCH`)
 	cached := 0
 	for i, line := range result.lines {
-		m := reFetch.FindStringSubmatch(line)
+		m := reFetchSeq.FindStringSubmatch(line)
 		if m != nil {
 			seq, _ := strconv.Atoi(m[1])
 			if lit, ok := result.literals[i]; ok {
@@ -255,7 +267,7 @@ func (ic *ImapConnection) fetchHeadersWithCache(seqNum int) (string, error) {
 			}
 		}
 	}
-	log.Printf("[%s] batch FETCH headers %d:%d, cached %d", ic.sessionID, start, end, cached)
+	log.Printf("[%s] batch headers %d:%d, cached %d", ic.sessionID, start, end, cached)
 
 	h, ok := ic.messageHdrs[seqNum]
 	if !ok {
@@ -276,39 +288,6 @@ func (ic *ImapConnection) fetchHeadersSingle(seqNum int) (string, error) {
 	ic.messageHdrs[seqNum] = h
 	log.Printf("[%s] FETCH headers #%d, %d bytes", ic.sessionID, seqNum, len(h))
 	return h, nil
-}
-
-func (ic *ImapConnection) fetchUids() error {
-	result, err := ic.sendCommand("FETCH 1:* (UID)")
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
-		return fmt.Errorf("FETCH UIDs failed: %s", result.tagged)
-	}
-
-	for _, line := range result.lines {
-		m := reUid.FindStringSubmatch(line)
-		if m != nil {
-			seq, _ := strconv.Atoi(m[1])
-			ic.messageUids[seq] = m[2]
-		}
-	}
-	log.Printf("[%s] FETCH UIDs OK, %d entries", ic.sessionID, len(ic.messageUids))
-	return nil
-}
-
-func (ic *ImapConnection) fetchMessage(seqNum int) (string, error) {
-	result, err := ic.sendCommand(fmt.Sprintf("FETCH %d (RFC822)", seqNum))
-	if err != nil {
-		return "", err
-	}
-	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
-		return "", fmt.Errorf("FETCH message failed: %s", result.tagged)
-	}
-	msg := ic.getLiteralForSeq(result, seqNum)
-	log.Printf("[%s] FETCH #%d OK, %d bytes", ic.sessionID, seqNum, len(msg))
-	return msg, nil
 }
 
 func (ic *ImapConnection) fetchTop(seqNum int, lineCount int) (string, error) {
@@ -345,6 +324,82 @@ func (ic *ImapConnection) fetchTop(seqNum int, lineCount int) (string, error) {
 	}
 	log.Printf("[%s] TOP #%d, %d body lines", ic.sessionID, seqNum, len(filtered))
 	return headers + "\r\n" + strings.Join(filtered, "\r\n"), nil
+}
+
+// fetchMessageWithCache: check cache first, fetch from IMAP if not cached
+func (ic *ImapConnection) fetchMessageWithCache(seqNum int) (string, error) {
+	if msg, ok := ic.messageCache[seqNum]; ok {
+		log.Printf("[%s] RETR #%d cached, %d bytes", ic.sessionID, seqNum, len(msg))
+		return msg, nil
+	}
+	return ic.fetchMessageSingle(seqNum)
+}
+
+func (ic *ImapConnection) fetchMessageSingle(seqNum int) (string, error) {
+	result, err := ic.sendCommand(fmt.Sprintf("FETCH %d (RFC822)", seqNum))
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
+		return "", fmt.Errorf("FETCH message failed: %s", result.tagged)
+	}
+	msg := ic.getLiteralForSeq(result, seqNum)
+	ic.messageCache[seqNum] = msg
+	log.Printf("[%s] FETCH #%d, %d bytes", ic.sessionID, seqNum, len(msg))
+	return msg, nil
+}
+
+// prefetchNextMessages: proactively fetch the next few messages after RETR
+// so they're cached when the POP3 client requests them
+func (ic *ImapConnection) prefetchNextMessages(afterSeqNum int) {
+	pipelineDepth := 3
+	var seqNums []int
+	var cmds []string
+	var buf strings.Builder
+
+	for i := 1; i <= pipelineDepth; i++ {
+		n := afterSeqNum + i
+		if n > ic.messageCount {
+			break
+		}
+		if _, ok := ic.messageCache[n]; ok {
+			continue // already cached
+		}
+		seqNums = append(seqNums, n)
+		tag := ic.nextTag()
+		cmds = append(cmds, tag)
+		fmt.Fprintf(&buf, "%s FETCH %d (RFC822)\r\n", tag, n)
+	}
+
+	if len(cmds) == 0 {
+		return
+	}
+
+	if verbose {
+		for i, n := range seqNums {
+			log.Printf("[%s] IMAP >>> %s FETCH %d (RFC822)", ic.sessionID, cmds[i], n)
+		}
+	}
+
+	if _, err := ic.conn.Write([]byte(buf.String())); err != nil {
+		log.Printf("[%s] prefetch send failed: %v", ic.sessionID, err)
+		return
+	}
+
+	cached := 0
+	for i, tag := range cmds {
+		result, err := ic.readResponse(tag)
+		if err != nil {
+			log.Printf("[%s] prefetch #%d failed: %v", ic.sessionID, seqNums[i], err)
+			continue
+		}
+		if strings.Contains(strings.ToUpper(result.tagged), "OK") {
+			msg := ic.getLiteralForSeq(result, seqNums[i])
+			ic.messageCache[seqNums[i]] = msg
+			cached++
+		}
+	}
+	log.Printf("[%s] prefetch after #%d, cached %d/%d", ic.sessionID, afterSeqNum, cached, len(cmds))
 }
 
 func (ic *ImapConnection) getLiteralForSeq(result imapResult, seqNum int) string {

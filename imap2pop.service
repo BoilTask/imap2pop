@@ -1,0 +1,14 @@
+[Unit]
+Description=imap2pop POP3-IMAP proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/imap2pop
+Environment=POP3_PORT=1100
+ExecStart=/opt/imap2pop/imap2pop
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

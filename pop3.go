@@ -21,11 +21,6 @@ type pop3Session struct {
 }
 
 func handlePop3Session(conn net.Conn) {
-	// Set TCP_NODELAY for lower latency on POP3 responses
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
-	}
-
 	remote := conn.RemoteAddr().String()
 	s := &pop3Session{
 		conn:      conn,
@@ -200,8 +195,7 @@ func (s *pop3Session) cmdPass(arg string) {
 		s.username = ""
 		return
 	}
-	// Combined: sizes + UIDs in one command
-	if err := ic.fetchSizesAndUids(); err != nil {
+	if err := ic.fetchSizes(); err != nil {
 		ic.close()
 		s.send("-ERR Login failed: " + err.Error())
 		s.username = ""
@@ -269,7 +263,7 @@ func (s *pop3Session) cmdRetr(arg string) {
 		return
 	}
 
-	msg, err := s.imap.fetchMessageWithCache(n)
+	msg, err := s.imap.fetchMessage(n)
 	if err != nil {
 		s.send("-ERR RETR failed: " + err.Error())
 		return
@@ -291,9 +285,6 @@ func (s *pop3Session) cmdRetr(arg string) {
 		formatted = append(formatted, l)
 	}
 	s.sendMulti(formatted)
-
-	// Prefetch next messages while POP3 client processes current
-	s.imap.prefetchNextMessages(n)
 }
 
 func (s *pop3Session) cmdDele(arg string) {
@@ -319,6 +310,13 @@ func (s *pop3Session) cmdUidl(arg string) {
 	if s.state != "TRANSACTION" {
 		s.send("-ERR UIDL only valid in TRANSACTION state")
 		return
+	}
+
+	if len(s.imap.messageUids) == 0 {
+		if err := s.imap.fetchUids(); err != nil {
+			s.send("-ERR UIDL failed: " + err.Error())
+			return
+		}
 	}
 
 	if arg != "" {

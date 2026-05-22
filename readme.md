@@ -18,8 +18,9 @@ go run .
 # 指定端口
 go run . -port 110
 
-# 环境变量方式
-POP3_PORT=110 go run .
+# 开启 IMAP 协议详细日志
+go run . -verbose
+VERBOSE=1 go run .
 ```
 
 编译为二进制：
@@ -27,6 +28,7 @@ POP3_PORT=110 go run .
 ```bash
 go build -o imap2pop .
 ./imap2pop -port 110
+./imap2pop -verbose   # 调试时开启
 ```
 
 ## ECS 部署
@@ -41,16 +43,23 @@ go build -o imap2pop .
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
 | `-port` | `POP3_PORT` | 1100 | POP3 监听端口 |
+| `-verbose` | `VERBOSE` | false | 输出 IMAP 协议交互详细日志 |
 
 IMAP 目标固定为 `imap.feishu.cn:993`。
 
 ## 日志
 
-所有 POP3 和 IMAP 交互均通过日志输出，格式包含 `[远程地址]` session 标识：
+默认日志仅输出关键事件和 POP3 命令，用 `[远程地址]` 标识 session：
 
 ```
-2026/05/22 13:31:02.123456 [192.168.1.1:54321] POP3 <<< USER tian.ouyang@feishu.cn
-2026/05/22 13:31:02.234567 [192.168.1.1:54321] POP3 >>> +OK User accepted
-2026/05/22 13:31:02.345678 [192.168.1.1:54321] IMAP >>> A1 LOGIN "tian.ouyang@feishu.cn" "password"
-2026/05/22 13:31:02.456789 [192.168.1.1:54321] IMAP <<< A1 OK LOGIN completed
+[113.108.28.64:18102] connected
+[113.108.28.64:18102] C USER tian.ouyang@feishu.cn
+[113.108.28.64:18102] S +OK User accepted
+[113.108.28.64:18102] LOGIN OK (tian.ouyang@feishu.cn)
+[113.108.28.64:18102] SELECT OK, 513 messages
+[113.108.28.64:18102] C STAT
+[113.108.28.64:18102] S +OK 513 12345678
+[113.108.28.64:18102] FETCH headers #1, 432 bytes
 ```
+
+开启 `-verbose` 后额外输出每条 IMAP 收发记录（调试用，生产环境不建议开启）。

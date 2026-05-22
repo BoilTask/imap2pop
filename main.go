@@ -11,6 +11,8 @@ import (
 	"syscall"
 )
 
+var verbose bool
+
 func main() {
 	defaultPort := 1100
 	if v := os.Getenv("POP3_PORT"); v != "" {
@@ -19,16 +21,16 @@ func main() {
 		}
 	}
 	port := flag.Int("port", defaultPort, "POP3 listen port")
+	flag.BoolVar(&verbose, "verbose", os.Getenv("VERBOSE") == "1", "Log IMAP protocol exchanges")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("imap2pop starting, listening on port %d, IMAP target: %s:%d", *port, imapHost, imapPort)
+	log.Printf("imap2pop starting on port %d, IMAP: %s:%d, verbose: %v", *port, imapHost, imapPort, verbose)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
 		log.Fatalf("Failed to listen on port %d: %v", *port, err)
 	}
-	log.Printf("POP3 server listening on port %d", *port)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -40,8 +42,6 @@ func main() {
 				log.Printf("Accept error: %v", err)
 				continue
 			}
-			remote := conn.RemoteAddr().String()
-			log.Printf("[%s] New POP3 connection", remote)
 			go handlePop3Session(conn)
 		}
 	}()

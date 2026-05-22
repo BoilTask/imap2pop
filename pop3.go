@@ -9,11 +9,11 @@ import (
 )
 
 type pop3Session struct {
-	conn     net.Conn
-	imap     *ImapConnection
-	state    string // AUTH, TRANSACTION, CLOSED
-	username string
-	buf      string
+	conn      net.Conn
+	imap      *ImapConnection
+	state     string // AUTH, TRANSACTION, CLOSED
+	username  string
+	buf       string
 	sessionID string
 
 	msgCount  int
@@ -34,33 +34,41 @@ func handlePop3Session(conn net.Conn) {
 			s.imap.close()
 		}
 		conn.Close()
-		log.Printf("[%s] POP3 session ended", s.sessionID)
+		log.Printf("[%s] session ended", s.sessionID)
 	}()
+
+	log.Printf("[%s] connected", remote)
 
 	for {
 		conn.SetDeadline(time.Time{})
 		buf := make([]byte, 4096)
 		n, err := conn.Read(buf)
 		if err != nil {
-			if err != net.ErrClosed {
-				log.Printf("[%s] POP3 read error: %v", s.sessionID, err)
+			if err != net.ErrClosed && !strings.Contains(err.Error(), "use of closed") {
+				log.Printf("[%s] read error: %v", s.sessionID, err)
 			}
 			return
 		}
 		s.buf += string(buf[:n])
 
 		for {
-			idx := strings.Index(s.buf, "\r\n")
-			if idx == -1 {
-				idx = strings.Index(s.buf, "\n")
-				if idx == -1 {
-					break
-				}
+			var idx int
+			var skip int
+			crlf := strings.Index(s.buf, "\r\n")
+			lf := strings.Index(s.buf, "\n")
+			if crlf != -1 {
+				idx = crlf
+				skip = 2
+			} else if lf != -1 {
+				idx = lf
+				skip = 1
+			} else {
+				break
 			}
 			line := strings.TrimSpace(s.buf[:idx])
-			s.buf = s.buf[idx+2:]
+			s.buf = s.buf[idx+skip:]
 			if line != "" {
-				log.Printf("[%s] POP3 <<< %s", s.sessionID, line)
+				log.Printf("[%s] C %s", s.sessionID, line)
 				s.dispatch(line)
 				if s.state == "CLOSED" {
 					return
@@ -71,7 +79,7 @@ func handlePop3Session(conn net.Conn) {
 }
 
 func (s *pop3Session) send(line string) {
-	log.Printf("[%s] POP3 >>> %s", s.sessionID, line)
+	log.Printf("[%s] S %s", s.sessionID, line)
 	if s.conn != nil {
 		s.conn.Write([]byte(line + "\r\n"))
 	}
@@ -90,7 +98,7 @@ func (s *pop3Session) sendMulti(lines []string) {
 		}
 	}
 	data := strings.Join(escaped, "\r\n") + "\r\n.\r\n"
-	log.Printf("[%s] POP3 >>> multi-line response (%d lines)", s.sessionID, len(escaped))
+	log.Printf("[%s] S multi (%d lines)", s.sessionID, len(escaped))
 	s.conn.Write([]byte(data))
 }
 

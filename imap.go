@@ -15,6 +15,13 @@ import (
 const imapHost = "imap.feishu.cn"
 const imapPort = 993
 
+var (
+	reLiteral    = regexp.MustCompile(`\{(\d+)\}$`)
+	reExists     = regexp.MustCompile(`\* (\d+) EXISTS`)
+	reSize       = regexp.MustCompile(`\* (\d+) FETCH \(RFC822\.SIZE (\d+)\)`)
+	reUid        = regexp.MustCompile(`\* (\d+) FETCH \(UID (\d+)\)`)
+)
+
 type imapResult struct {
 	lines    []string
 	literals map[int]string
@@ -55,17 +62,15 @@ func (ic *ImapConnection) connect() error {
 	greeting, err := ic.reader.ReadString('\n')
 	if err != nil {
 		conn.Close()
-		log.Printf("[%s] IMAP greeting read failed: %v", ic.sessionID, err)
 		return fmt.Errorf("IMAP greeting read failed: %v", err)
 	}
 	greeting = strings.TrimRight(greeting, "\r\n")
 	up := strings.ToUpper(greeting)
 	if !strings.HasPrefix(up, "* OK") && !strings.HasPrefix(up, "* PREAUTH") {
 		conn.Close()
-		log.Printf("[%s] Bad IMAP greeting: %s", ic.sessionID, greeting)
 		return fmt.Errorf("Bad IMAP greeting: %s", greeting)
 	}
-	log.Printf("[%s] IMAP connected, greeting: %s", ic.sessionID, greeting)
+	log.Printf("[%s] IMAP connected", ic.sessionID)
 	return nil
 }
 
@@ -76,11 +81,11 @@ func (ic *ImapConnection) nextTag() string {
 
 func (ic *ImapConnection) sendCommand(cmd string) (imapResult, error) {
 	tag := ic.nextTag()
-	fullCmd := fmt.Sprintf("%s %s", tag, cmd)
-	log.Printf("[%s] IMAP >>> %s", ic.sessionID, fullCmd)
+	if verbose {
+		log.Printf("[%s] IMAP >>> %s %s", ic.sessionID, tag, cmd)
+	}
 
-	if _, err := fmt.Fprintf(ic.conn, "%s\r\n", fullCmd); err != nil {
-		log.Printf("[%s] IMAP send failed: %v", ic.sessionID, err)
+	if _, err := fmt.Fprintf(ic.conn, "%s %s\r\n", tag, cmd); err != nil {
 		return imapResult{}, fmt.Errorf("send IMAP command failed: %v", err)
 	}
 	return ic.readResponse(tag)
@@ -93,21 +98,26 @@ func (ic *ImapConnection) readResponse(tag string) (imapResult, error) {
 	for {
 		line, literal, err := ic.readLine()
 		if err != nil {
-			log.Printf("[%s] IMAP read error: %v", ic.sessionID, err)
 			return imapResult{}, fmt.Errorf("read IMAP response: %v", err)
 		}
 
 		if strings.HasPrefix(line, tag+" ") {
-			log.Printf("[%s] IMAP <<< %s", ic.sessionID, line)
+			if verbose {
+				log.Printf("[%s] IMAP <<< %s", ic.sessionID, line)
+			}
 			return imapResult{lines: lines, literals: literals, tagged: line}, nil
 		}
 
-		log.Printf("[%s] IMAP <<< %s", ic.sessionID, line)
+		if verbose {
+			log.Printf("[%s] IMAP <<< %s", ic.sessionID, line)
+			if literal != "" {
+				log.Printf("[%s] IMAP <<< [literal %d bytes]", ic.sessionID, len(literal))
+			}
+		}
 		idx := len(lines)
 		lines = append(lines, line)
 		if literal != "" {
 			literals[idx] = literal
-			log.Printf("[%s] IMAP <<< [literal %d bytes]", ic.sessionID, len(literal))
 		}
 	}
 }
@@ -119,15 +129,12 @@ func (ic *ImapConnection) readLine() (string, string, error) {
 	}
 	line = strings.TrimRight(line, "\r\n")
 
-	// Check for IMAP literal: {N}
-	litRe := regexp.MustCompile(`\{(\d+)\}$`)
-	m := litRe.FindStringSubmatch(line)
+	m := reLiteral.FindStringSubmatch(line)
 	if m == nil {
 		return line, "", nil
 	}
 
 	litLen, _ := strconv.Atoi(m[1])
-
 	litBuf := make([]byte, litLen)
 	if _, err := io.ReadFull(ic.reader, litBuf); err != nil {
 		return "", "", fmt.Errorf("read literal failed: %v", err)
@@ -140,7 +147,7 @@ func (ic *ImapConnection) readLine() (string, string, error) {
 	}
 	afterLine = strings.TrimRight(afterLine, "\r\n")
 
-	line = litRe.ReplaceAllString(line, "") + afterLine
+	line = reLiteral.ReplaceAllString(line, "") + afterLine
 	return line, literal, nil
 }
 
@@ -150,10 +157,9 @@ func (ic *ImapConnection) login(username, password string) error {
 		return err
 	}
 	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
-		log.Printf("[%s] IMAP LOGIN failed: %s", ic.sessionID, result.tagged)
 		return fmt.Errorf("IMAP LOGIN failed: %s", result.tagged)
 	}
-	log.Printf("[%s] IMAP LOGIN OK for %s", ic.sessionID, username)
+	log.Printf("[%s] LOGIN OK (%s)", ic.sessionID, username)
 	return nil
 }
 
@@ -163,7 +169,6 @@ func (ic *ImapConnection) selectInbox() error {
 		return err
 	}
 	if !strings.Contains(strings.ToUpper(result.tagged), "OK") {
-		log.Printf("[%s] IMAP SELECT failed: %s", ic.sessionID, result.tagged)
 		return fmt.Errorf("IMAP SELECT failed: %s", result.tagged)
 	}
 
@@ -172,14 +177,13 @@ func (ic *ImapConnection) selectInbox() error {
 	ic.deleted = make(map[int]bool)
 	ic.messageCount = 0
 
-	existsRe := regexp.MustCompile(`\* (\d+) EXISTS`)
 	for _, line := range result.lines {
-		m := existsRe.FindStringSubmatch(line)
+		m := reExists.FindStringSubmatch(line)
 		if m != nil {
 			ic.messageCount, _ = strconv.Atoi(m[1])
 		}
 	}
-	log.Printf("[%s] IMAP SELECT OK, %d messages in INBOX", ic.sessionID, ic.messageCount)
+	log.Printf("[%s] SELECT OK, %d messages", ic.sessionID, ic.messageCount)
 	return nil
 }
 
@@ -192,9 +196,8 @@ func (ic *ImapConnection) fetchSizes() error {
 		return fmt.Errorf("FETCH sizes failed: %s", result.tagged)
 	}
 
-	sizeRe := regexp.MustCompile(`\* (\d+) FETCH \(RFC822\.SIZE (\d+)\)`)
 	for _, line := range result.lines {
-		m := sizeRe.FindStringSubmatch(line)
+		m := reSize.FindStringSubmatch(line)
 		if m != nil {
 			seq, _ := strconv.Atoi(m[1])
 			size, _ := strconv.Atoi(m[2])
@@ -214,9 +217,8 @@ func (ic *ImapConnection) fetchUids() error {
 		return fmt.Errorf("FETCH UIDs failed: %s", result.tagged)
 	}
 
-	uidRe := regexp.MustCompile(`\* (\d+) FETCH \(UID (\d+)\)`)
 	for _, line := range result.lines {
-		m := uidRe.FindStringSubmatch(line)
+		m := reUid.FindStringSubmatch(line)
 		if m != nil {
 			seq, _ := strconv.Atoi(m[1])
 			ic.messageUids[seq] = m[2]
@@ -235,7 +237,7 @@ func (ic *ImapConnection) fetchMessage(seqNum int) (string, error) {
 		return "", fmt.Errorf("FETCH message failed: %s", result.tagged)
 	}
 	msg := ic.getLiteralForSeq(result, seqNum)
-	log.Printf("[%s] FETCH message #%d, %d bytes", ic.sessionID, seqNum, len(msg))
+	log.Printf("[%s] FETCH #%d OK, %d bytes", ic.sessionID, seqNum, len(msg))
 	return msg, nil
 }
 
@@ -284,7 +286,7 @@ func (ic *ImapConnection) fetchTop(seqNum int, lineCount int) (string, error) {
 	if len(filtered) == 0 {
 		return headers, nil
 	}
-	log.Printf("[%s] FETCH TOP #%d, %d body lines", ic.sessionID, seqNum, len(filtered))
+	log.Printf("[%s] TOP #%d, %d body lines", ic.sessionID, seqNum, len(filtered))
 	return headers + "\r\n" + strings.Join(filtered, "\r\n"), nil
 }
 
@@ -317,11 +319,12 @@ func (ic *ImapConnection) resetDeleted() error {
 	if len(ic.deleted) == 0 {
 		return nil
 	}
+	count := len(ic.deleted)
 	for seqNum := range ic.deleted {
 		_, _ = ic.sendCommand(fmt.Sprintf("STORE %d -FLAGS (\\Deleted)", seqNum))
 	}
 	ic.deleted = make(map[int]bool)
-	log.Printf("[%s] RSET OK, cleared %d deletions", ic.sessionID, len(ic.deleted))
+	log.Printf("[%s] RSET OK, cleared %d deletions", ic.sessionID, count)
 	return nil
 }
 
@@ -337,7 +340,7 @@ func (ic *ImapConnection) expunge() error {
 func (ic *ImapConnection) logout() {
 	_, _ = ic.sendCommand("LOGOUT")
 	ic.close()
-	log.Printf("[%s] IMAP session closed", ic.sessionID)
+	log.Printf("[%s] IMAP closed", ic.sessionID)
 }
 
 func (ic *ImapConnection) close() {
